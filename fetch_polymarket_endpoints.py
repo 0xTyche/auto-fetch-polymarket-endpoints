@@ -25,6 +25,30 @@ POLYMARKET_HOME = "https://polymarket.com"
 CLOB_ORIGIN = "https://clob.polymarket.com"
 GAMMA_ORIGIN = "https://gamma-api.polymarket.com"
 
+# Default "useful" API hosts (exclude polymarket.com webapp internals).
+DEFAULT_PUBLIC_HOSTS = {
+    "gamma-api.polymarket.com",
+    "clob.polymarket.com",
+    "bridge.polymarket.com",
+    "data-api.polymarket.com",
+    "relayer-v2.polymarket.com",
+    "user-pnl-api.polymarket.com",
+    "builders.polymarket.com",
+    "status.polymarket.com",
+    "recovery.polymarket.com",
+    "matic-recovery.polymarket.com",
+    "worldcoin.polymarket.com",
+}
+
+DEFAULT_EXCLUDED_HOSTS = {
+    "docs.polymarket.com",
+    "help.polymarket.com",
+    "images.polymarket.com",
+    "news.polymarket.com",
+    "learn.polymarket.com",
+    "embed.polymarket.com",
+}
+
 
 @dataclasses.dataclass(frozen=True)
 class Evidence:
@@ -39,6 +63,8 @@ class Endpoint:
     host: str  # empty if unknown (relative-only)
     path: str  # empty if unknown
     method: str  # "GET"/"POST"/... or ""
+    description: str  # short human description (may be empty)
+    source_kind: str  # "docs" | "js" | "seed"
     evidence: Evidence
 
 
@@ -254,6 +280,57 @@ def _infer_method_near(text: str, needle: str) -> str:
     return ""
 
 
+def _parse_llms_index(llms_text: str) -> tuple[list[str], dict[str, dict[str, str]]]:
+    """
+    Parse https://docs.polymarket.com/llms.txt (markdown).
+
+    Returns:
+      - docs_urls: list of https://docs.polymarket.com/... URLs
+      - meta_by_url: { url: { "title": str, "summary": str } }
+    """
+    docs_urls: list[str] = []
+    meta_by_url: dict[str, dict[str, str]] = {}
+
+    md_re = re.compile(r"^\s*-\s*\[(?P<title>[^\]]+)\]\((?P<url>https?://[^)]+)\)\s*(?::\s*(?P<summary>.*))?$")
+
+    for line in llms_text.splitlines():
+        m = md_re.match(line.strip())
+        if not m:
+            continue
+        url = _defrag(_normalize_urlish(m.group("url")))
+        if url.startswith("http://docs.polymarket.com/"):
+            url = url.replace("http://", "https://", 1)
+        if not url.startswith("https://docs.polymarket.com/"):
+            continue
+
+        title = (m.group("title") or "").strip()
+        summary = (m.group("summary") or "").strip()
+
+        docs_urls.append(url)
+        meta_by_url.setdefault(url, {"title": "", "summary": ""})
+        if title and not meta_by_url[url]["title"]:
+            meta_by_url[url]["title"] = title
+        if summary and not meta_by_url[url]["summary"]:
+            meta_by_url[url]["summary"] = summary
+
+    # Fallback: extract any docs urls even if line format changes.
+    for u in _extract_full_urls(llms_text) + _extract_schemeless_polymarket_urls(llms_text):
+        u = _defrag(_normalize_urlish(u))
+        if u.startswith("http://docs.polymarket.com/"):
+            u = u.replace("http://", "https://", 1)
+        if u.startswith("https://docs.polymarket.com/"):
+            docs_urls.append(u)
+
+    seen = set()
+    out: list[str] = []
+    for u in docs_urls:
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out, meta_by_url
+
+
 class Fetcher:
     def __init__(self, timeout_s: int = 20, max_retries: int = 3, user_agent: str = "endpoint-catalog-bot/1.0"):
         self.timeout_s = timeout_s
@@ -333,19 +410,8 @@ def _extract_from_text(text: str) -> tuple[list[str], list[str]]:
 
 def _collect_docs_pages(fetcher: Fetcher) -> list[str]:
     llms = fetcher.get(DOCS_LLMS_TXT)
-    # llms.txt is markdown; extract URLs from link targets.
-    urls = _extract_full_urls(llms) + _extract_schemeless_polymarket_urls(llms)
-    urls = [u for u in urls if u.startswith("https://docs.polymarket.com/") or u.startswith("http://docs.polymarket.com/")]
-    urls = [_defrag(_normalize_urlish(u)) for u in urls]
-    # de-dupe while preserving order
-    seen = set()
-    out: list[str] = []
-    for u in urls:
-        if u in seen:
-            continue
-        seen.add(u)
-        out.append(u)
-    return out
+    urls, _meta = _parse_llms_index(llms)
+    return urls
 
 
 def _collect_polymarket_js_urls(fetcher: Fetcher) -> list[str]:
@@ -393,13 +459,16 @@ def _filter_to_polymarketish(urls: Iterable[str]) -> list[str]:
 def _make_endpoint_items(
     *,
     source_url: str,
+    source_kind: str,
     text: str,
     full_urls: Iterable[str],
     rel_paths: Iterable[str],
+    docs_meta_by_url: dict[str, dict[str, str]] | None = None,
     max_evidence_len: int = 240,
 ) -> list[Endpoint]:
     items: list[Endpoint] = []
     origin = _source_origin(source_url)
+    docs_meta_by_url = docs_meta_by_url or {}
 
     def add(raw: str) -> None:
         norm = _defrag(_normalize_urlish(raw))
@@ -417,6 +486,8 @@ def _make_endpoint_items(
         # Skip broken template fragments.
         if "{var}" in norm and norm.count("{var}") >= 2:
             return
+        meta = docs_meta_by_url.get(source_url) or {}
+        desc = (meta.get("summary") or meta.get("title") or "").strip()
         ctx = norm
         if len(ctx) > max_evidence_len:
             ctx = ctx[: max_evidence_len - 3] + "..."
@@ -427,6 +498,8 @@ def _make_endpoint_items(
                 host=host,
                 path=path,
                 method=method,
+                description=desc,
+                source_kind=source_kind,
                 evidence=Evidence(source_url=source_url, context=ctx),
             )
         )
@@ -441,6 +514,177 @@ def _make_endpoint_items(
 def _key(ep: Endpoint) -> str:
     # method may be unknown; keep method in key only if present
     return f"{ep.method or '*'} {ep.normalized}"
+
+
+def _is_doc_like_path(path: str) -> bool:
+    # These are documentation sections, not API endpoints.
+    return any(
+        seg in (path or "")
+        for seg in (
+            "/api-reference/",
+            "/market-data/",
+            "/market-makers/",
+            "/trading/",
+            "/concepts/",
+            "/builders/",
+            "/resources/",
+        )
+    )
+
+
+def _heuristic_description(ep: Endpoint) -> str:
+    host = (ep.host or "").lower()
+    path = ep.path or ""
+    method = (ep.method or "").upper()
+
+    def m(desc: str) -> str:
+        # Keep it short and consistent.
+        return desc.strip().rstrip(".") + "."
+
+    if host == "gamma-api.polymarket.com":
+        if path == "/events":
+            return m("List events")
+        if path.startswith("/events/slug"):
+            return m("Get event by slug")
+        if path.startswith("/events/"):
+            return m("Get event by id")
+        if path == "/markets":
+            return m("List markets")
+        if path.startswith("/markets/"):
+            return m("Get market by id")
+        if path == "/tags":
+            return m("List tags")
+        if path == "/comments":
+            return m("List or create comments")
+        if path.startswith("/comments/"):
+            return m("Get or manage a comment")
+        if path.startswith("/search"):
+            return m("Search markets, events, and profiles")
+        return m("Gamma API endpoint")
+
+    if host == "clob.polymarket.com":
+        if path == "/book":
+            return m("Get order book summary for a token_id")
+        if path == "/books":
+            return m("Get order books for multiple token_ids")
+        if path == "/midpoint":
+            return m("Get midpoint price for a token_id")
+        if path == "/order":
+            if method == "POST":
+                return m("Create a new order")
+            if method == "DELETE":
+                return m("Cancel a single order")
+            return m("Create or cancel an order")
+        if path == "/orders":
+            if method == "GET":
+                return m("List user orders")
+            if method == "DELETE":
+                return m("Cancel multiple orders")
+            return m("List or cancel orders")
+        if path.startswith("/auth/"):
+            return m("Authentication / API key flow")
+        if "cancel" in path:
+            return m("Cancel orders")
+        if "trade" in path or path.startswith("/trades"):
+            return m("Trades data")
+        return m("CLOB API endpoint")
+
+    if host == "bridge.polymarket.com":
+        if path == "/quote":
+            return m("Get bridge quote")
+        if path == "/supported-assets":
+            return m("List supported bridge assets")
+        if path.startswith("/status"):
+            return m("Get bridge transaction status")
+        if path == "/deposit":
+            return m("Create deposit addresses / start deposit")
+        if path == "/withdraw":
+            return m("Create withdrawal addresses / start withdrawal")
+        return m("Bridge API endpoint")
+
+    if host.endswith(".polymarket.com"):
+        return m("Polymarket endpoint (purpose not in docs index)")
+
+    return m("Endpoint (purpose unknown)")
+
+
+def _is_specific_docs_source(url: str) -> bool:
+    """
+    True if the docs page is likely dedicated to a specific API endpoint.
+    """
+    if not url.startswith("https://docs.polymarket.com/"):
+        return False
+    p = urllib.parse.urlparse(url).path
+    # Exclude "general" pages that mention many endpoints.
+    if p.endswith(("/api-reference/rate-limits.md", "/api-reference/clients-sdks.md", "/api-reference/introduction.md")):
+        return False
+    return ("/api-reference/" in p) or ("/trading/bridge/" in p) or p.startswith("/builders/")
+
+
+def _best_description(ep: Endpoint) -> str:
+    """
+    Prefer endpoint-specific docs descriptions; otherwise fall back to heuristics.
+    """
+    d = (ep.description or "").strip()
+    if d and ep.source_kind == "docs" and _is_specific_docs_source(ep.evidence.source_url):
+        # Ensure it ends with a period for consistent rendering.
+        return d if d.endswith(".") else d + "."
+    return _heuristic_description(ep)
+
+
+def _filter_endpoints(
+    endpoints: list[Endpoint],
+    *,
+    all_hosts: bool,
+    include_webapp: bool,
+    include_staging: bool,
+    include_hosts: set[str],
+    exclude_hosts: set[str],
+) -> list[Endpoint]:
+    if all_hosts:
+        return endpoints
+
+    allowed = set(DEFAULT_PUBLIC_HOSTS) | set(include_hosts)
+    if include_webapp:
+        allowed.add("polymarket.com")
+    if include_staging:
+        allowed.add("clob-staging.polymarket.com")
+
+    out: list[Endpoint] = []
+    for ep in endpoints:
+        host = (ep.host or "").lower()
+        if not host:
+            continue
+        if host in DEFAULT_EXCLUDED_HOSTS:
+            continue
+        if host in exclude_hosts:
+            continue
+        if host not in allowed:
+            continue
+        if _is_doc_like_path(ep.path or ""):
+            continue
+        out.append(ep)
+    return out
+
+
+def _drop_methodless_if_methodful(endpoints: list[Endpoint]) -> list[Endpoint]:
+    """
+    If we have both:
+      - "* https://host/path" (unknown method)
+      - "GET/POST/... https://host/path"
+    keep only the method-specific ones.
+    """
+    buckets: dict[str, list[Endpoint]] = {}
+    for ep in endpoints:
+        buckets.setdefault(ep.normalized, []).append(ep)
+
+    out: list[Endpoint] = []
+    for _norm, lst in buckets.items():
+        if any(e.method for e in lst):
+            out.extend([e for e in lst if e.method])
+        else:
+            out.extend(lst)
+    return out
 
 
 def _load_seen(cache_path: Path) -> set[str]:
@@ -475,6 +719,8 @@ def _render_md(endpoints: list[Endpoint], meta: dict) -> str:
     lines.append("## Metadata")
     lines.append("")
     lines.append(f"- **generated_at**: `{meta.get('generated_at')}`")
+    if meta.get("filters"):
+        lines.append(f"- **filters**: `{json.dumps(meta.get('filters'), ensure_ascii=False)}`")
     lines.append(f"- **sources**: {len(meta.get('sources', []))}")
     lines.append(f"- **total_endpoints**: {len(endpoints)}")
     lines.append("")
@@ -491,7 +737,8 @@ def _render_md(endpoints: list[Endpoint], meta: dict) -> str:
         eps = sorted(groups[host], key=lambda e: (e.path or e.normalized, e.method or ""))
         for ep in eps:
             m = ep.method or "*"
-            lines.append(f"- **{m}** `{ep.normalized}`")
+            desc = _best_description(ep)
+            lines.append(f"- **{m}** `{ep.normalized}` — {desc}")
             lines.append(f"  - evidence: `{ep.evidence.source_url}`")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
@@ -532,6 +779,11 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--cache-dir", default=".cache", help="Cache directory (default: .cache)")
     ap.add_argument("--no-cache", action="store_true", help="Disable cache/diff output")
     ap.add_argument("--seed-url", action="append", default=[], help="Extra URL to crawl (repeatable)")
+    ap.add_argument("--all-hosts", action="store_true", help="Do not filter hosts (include everything found)")
+    ap.add_argument("--include-webapp", action="store_true", help="Include polymarket.com internal webapp endpoints")
+    ap.add_argument("--include-staging", action="store_true", help="Include staging hosts (e.g. clob-staging)")
+    ap.add_argument("--include-host", action="append", default=[], help="Include an extra host (repeatable)")
+    ap.add_argument("--exclude-host", action="append", default=[], help="Exclude a host (repeatable)")
     ap.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds (default: 20)")
     ap.add_argument("--max-pages", type=int, default=400, help="Max docs pages to crawl (default: 400)")
     args = ap.parse_args(argv)
@@ -544,10 +796,13 @@ def main(argv: list[str]) -> int:
 
     sources: list[str] = []
     endpoints: list[Endpoint] = []
+    docs_meta_by_url: dict[str, dict[str, str]] = {}
 
     # 1) Docs pages from llms.txt
     try:
-        docs_pages = _collect_docs_pages(fetcher)[: args.max_pages]
+        llms = fetcher.get(DOCS_LLMS_TXT)
+        docs_pages, docs_meta_by_url = _parse_llms_index(llms)
+        docs_pages = docs_pages[: args.max_pages]
         sources.extend(docs_pages)
     except Exception as e:
         print(f"[warn] unable to load docs index {DOCS_LLMS_TXT}: {e}", file=sys.stderr)
@@ -585,7 +840,16 @@ def main(argv: list[str]) -> int:
             continue
         full, rel = _extract_from_html(html)
         full = _filter_to_polymarketish(full)
-        add_items(_make_endpoint_items(source_url=url, text=html, full_urls=full, rel_paths=rel))
+        add_items(
+            _make_endpoint_items(
+                source_url=url,
+                source_kind="docs",
+                text=html,
+                full_urls=full,
+                rel_paths=rel,
+                docs_meta_by_url=docs_meta_by_url,
+            )
+        )
 
     # Crawl JS bundles
     for url in js_urls:
@@ -595,7 +859,16 @@ def main(argv: list[str]) -> int:
             continue
         full, rel = _extract_from_text(js)
         full = _filter_to_polymarketish(full)
-        add_items(_make_endpoint_items(source_url=url, text=js, full_urls=full, rel_paths=rel))
+        add_items(
+            _make_endpoint_items(
+                source_url=url,
+                source_kind="js",
+                text=js,
+                full_urls=full,
+                rel_paths=rel,
+                docs_meta_by_url=docs_meta_by_url,
+            )
+        )
 
     # Crawl seed URLs (best-effort: html/text)
     for url in args.seed_url:
@@ -605,14 +878,41 @@ def main(argv: list[str]) -> int:
             continue
         full, rel = _extract_from_text(body)
         full = _filter_to_polymarketish(full)
-        add_items(_make_endpoint_items(source_url=url, text=body, full_urls=full, rel_paths=rel))
+        add_items(
+            _make_endpoint_items(
+                source_url=url,
+                source_kind="seed",
+                text=body,
+                full_urls=full,
+                rel_paths=rel,
+                docs_meta_by_url=docs_meta_by_url,
+            )
+        )
 
     # Final sort stable
-    endpoints_sorted = sorted(endpoints, key=lambda e: (e.host or "", e.path or e.normalized, e.method or "", e.normalized))
+    endpoints = _drop_methodless_if_methodful(endpoints)
+    include_hosts = {h.strip().lower() for h in (args.include_host or []) if h.strip()}
+    exclude_hosts = {h.strip().lower() for h in (args.exclude_host or []) if h.strip()}
+    endpoints_filtered = _filter_endpoints(
+        endpoints,
+        all_hosts=bool(args.all_hosts),
+        include_webapp=bool(args.include_webapp),
+        include_staging=bool(args.include_staging),
+        include_hosts=include_hosts,
+        exclude_hosts=exclude_hosts,
+    )
+    endpoints_sorted = sorted(endpoints_filtered, key=lambda e: (e.host or "", e.path or e.normalized, e.method or "", e.normalized))
 
     meta = {
         "generated_at": _now_iso(),
         "sources": sorted(set(sources)),
+        "filters": {
+            "all_hosts": bool(args.all_hosts),
+            "include_webapp": bool(args.include_webapp),
+            "include_staging": bool(args.include_staging),
+            "include_host": sorted(include_hosts),
+            "exclude_host": sorted(exclude_hosts),
+        },
         "counts": {
             "sources_total": len(sources),
             "endpoints_total": len(endpoints_sorted),
@@ -636,6 +936,8 @@ def main(argv: list[str]) -> int:
                 "method": e.method,
                 "host": e.host,
                 "path": e.path,
+                "description": _best_description(e),
+                "source_kind": e.source_kind,
                 "evidence": dataclasses.asdict(e.evidence),
             }
             for e in endpoints_sorted

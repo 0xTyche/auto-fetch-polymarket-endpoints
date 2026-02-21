@@ -1,7 +1,5 @@
 # auto-fetch-polymarket-endpoints
 
-可以获取 polymarket 的所有 endpoint 并存储在 out 文件夹下，并且整理成适合 vibe coding 的文档。
-
 Fetch Polymarket-related HTTP endpoints and write them to files you can keep in a project.
 
 ## What it does
@@ -24,6 +22,12 @@ python3 fetch_polymarket_endpoints.py
 Common options:
 
 ```bash
+# include everything (including polymarket.com webapp internals)
+python3 fetch_polymarket_endpoints.py --all-hosts
+
+# include polymarket.com internal webapp endpoints
+python3 fetch_polymarket_endpoints.py --include-webapp
+
 # add extra pages to scan (repeatable)
 python3 fetch_polymarket_endpoints.py --seed-url "https://docs.polymarket.com/quickstart.md"
 

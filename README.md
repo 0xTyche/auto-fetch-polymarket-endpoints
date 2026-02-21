@@ -28,6 +28,12 @@ python3 fetch_polymarket_endpoints.py --all-hosts
 # include polymarket.com internal webapp endpoints
 python3 fetch_polymarket_endpoints.py --include-webapp
 
+# scan official SDKs for extra endpoints (slower, may catch undocumented ones)
+python3 fetch_polymarket_endpoints.py --scan-sdks
+
+# probe for undocumented CLOB read endpoints (safe GET requests)
+python3 fetch_polymarket_endpoints.py --probe-clob
+
 # add extra pages to scan (repeatable)
 python3 fetch_polymarket_endpoints.py --seed-url "https://docs.polymarket.com/quickstart.md"
 

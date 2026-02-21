@@ -10,6 +10,8 @@ import re
 import sys
 import time
 import gzip
+import tarfile
+import io
 import urllib.request
 import urllib.parse
 import urllib.error
@@ -24,6 +26,8 @@ DOCS_LLMS_TXT = "https://docs.polymarket.com/llms.txt"
 POLYMARKET_HOME = "https://polymarket.com"
 CLOB_ORIGIN = "https://clob.polymarket.com"
 GAMMA_ORIGIN = "https://gamma-api.polymarket.com"
+NPM_CLOB_CLIENT_REGISTRY = "https://registry.npmjs.org/@polymarket/clob-client"
+PYPI_CLOB_CLIENT_JSON = "https://pypi.org/pypi/py-clob-client/json"
 
 # Default "useful" API hosts (exclude polymarket.com webapp internals).
 DEFAULT_PUBLIC_HOSTS = {
@@ -362,6 +366,29 @@ class Fetcher:
                     time.sleep(0.6 * attempt)
         raise RuntimeError(f"failed to fetch {url}: {last_err}")
 
+    def get_bytes(self, url: str) -> bytes:
+        last_err: Optional[Exception] = None
+        for attempt in range(1, self.max_retries + 1):
+            try:
+                req = urllib.request.Request(
+                    url,
+                    headers={
+                        "User-Agent": self.user_agent,
+                        "Accept": "*/*",
+                    },
+                    method="GET",
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout_s) as resp:
+                    raw = resp.read()
+                    if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
+                        raw = gzip.decompress(raw)
+                    return raw
+            except Exception as e:
+                last_err = e
+                if attempt < self.max_retries:
+                    time.sleep(0.6 * attempt)
+        raise RuntimeError(f"failed to fetch bytes {url}: {last_err}")
+
 class _TextAndScriptsParser(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -435,6 +462,87 @@ def _collect_polymarket_js_urls(fetcher: Fetcher) -> list[str]:
     return out
 
 
+def _scan_tar_gz_text_files(
+    *,
+    archive_bytes: bytes,
+    allowed_suffixes: tuple[str, ...],
+    max_file_bytes: int = 2_000_000,
+) -> dict[str, str]:
+    """
+    Returns { member_name: decoded_text } for text-like members.
+    """
+    out: dict[str, str] = {}
+    bio = io.BytesIO(archive_bytes)
+    with tarfile.open(fileobj=bio, mode="r:gz") as tf:
+        for m in tf.getmembers():
+            if not m.isfile():
+                continue
+            name = m.name or ""
+            if not name.endswith(allowed_suffixes):
+                continue
+            if m.size is not None and m.size > max_file_bytes:
+                continue
+            f = tf.extractfile(m)
+            if not f:
+                continue
+            raw = f.read(max_file_bytes + 1)
+            if len(raw) > max_file_bytes:
+                continue
+            try:
+                out[name] = raw.decode("utf-8", errors="replace")
+            except Exception:
+                continue
+    return out
+
+
+def _collect_sdk_endpoints_npm_clob_client(fetcher: Fetcher) -> tuple[list[str], list[tuple[str, str]]]:
+    """
+    Returns (sources, items) where items are (source_url, text).
+    """
+    reg = json.loads(fetcher.get(NPM_CLOB_CLIENT_REGISTRY))
+    ver = (reg.get("dist-tags") or {}).get("latest")
+    if not ver:
+        raise RuntimeError("npm registry: missing dist-tags.latest")
+    vinfo = (reg.get("versions") or {}).get(ver) or {}
+    tarball = ((vinfo.get("dist") or {}).get("tarball") or "").strip()
+    if not tarball:
+        raise RuntimeError("npm registry: missing tarball url")
+
+    tgz = fetcher.get_bytes(tarball)
+    files = _scan_tar_gz_text_files(archive_bytes=tgz, allowed_suffixes=(".js", ".ts", ".mjs", ".cjs", ".json"))
+    sources = [tarball]
+    items: list[tuple[str, str]] = []
+    for name, text in files.items():
+        items.append((f"{tarball}#{name}", text))
+    return sources, items
+
+
+def _collect_sdk_endpoints_pypi_py_clob_client(fetcher: Fetcher) -> tuple[list[str], list[tuple[str, str]]]:
+    """
+    Returns (sources, items) where items are (source_url, text).
+    """
+    meta = json.loads(fetcher.get(PYPI_CLOB_CLIENT_JSON))
+    urls = meta.get("urls") or []
+    sdist = ""
+    for u in urls:
+        if (u.get("packagetype") or "") == "sdist" and (u.get("url") or "").endswith((".tar.gz", ".tgz")):
+            sdist = u.get("url") or ""
+            break
+    if not sdist and urls:
+        # fall back to first url
+        sdist = (urls[0].get("url") or "").strip()
+    if not sdist:
+        raise RuntimeError("pypi: missing sdist url")
+
+    tgz = fetcher.get_bytes(sdist)
+    files = _scan_tar_gz_text_files(archive_bytes=tgz, allowed_suffixes=(".py", ".json", ".md", ".txt"))
+    sources = [sdist]
+    items: list[tuple[str, str]] = []
+    for name, text in files.items():
+        items.append((f"{sdist}#{name}", text))
+    return sources, items
+
+
 def _filter_to_polymarketish(urls: Iterable[str]) -> list[str]:
     out: list[str] = []
     for u in urls:
@@ -464,6 +572,7 @@ def _make_endpoint_items(
     full_urls: Iterable[str],
     rel_paths: Iterable[str],
     docs_meta_by_url: dict[str, dict[str, str]] | None = None,
+    force_origin: str | None = None,
     max_evidence_len: int = 240,
 ) -> list[Endpoint]:
     items: list[Endpoint] = []
@@ -478,7 +587,7 @@ def _make_endpoint_items(
             return
         # If it's a relative endpoint, attach it to a best-guess origin.
         if norm.startswith("/"):
-            base = _pick_base_for_relative_path(norm, source_url, text) or origin
+            base = force_origin or _pick_base_for_relative_path(norm, source_url, text) or origin
             if base:
                 norm = urllib.parse.urljoin(base, norm)
         host, path = _parse_host_path(norm)
@@ -569,6 +678,8 @@ def _heuristic_description(ep: Endpoint) -> str:
             return m("Get order books for multiple token_ids")
         if path == "/midpoint":
             return m("Get midpoint price for a token_id")
+        if path == "/orderbook-history":
+            return m("Get order book history for an asset_id (time range)")
         if path == "/order":
             if method == "POST":
                 return m("Create a new order")
@@ -626,6 +737,8 @@ def _best_description(ep: Endpoint) -> str:
     Prefer endpoint-specific docs descriptions; otherwise fall back to heuristics.
     """
     d = (ep.description or "").strip()
+    if d and ep.source_kind == "probe":
+        return d if d.endswith(".") else d + "."
     if d and ep.source_kind == "docs" and _is_specific_docs_source(ep.evidence.source_url):
         # Ensure it ends with a period for consistent rendering.
         return d if d.endswith(".") else d + "."
@@ -684,6 +797,61 @@ def _drop_methodless_if_methodful(endpoints: list[Endpoint]) -> list[Endpoint]:
             out.extend([e for e in lst if e.method])
         else:
             out.extend(lst)
+    return out
+
+
+def _http_status(fetcher: Fetcher, url: str) -> int:
+    """
+    Returns HTTP status code, or -1 on network/unknown errors.
+    """
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": fetcher.user_agent, "Accept": "*/*"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=fetcher.timeout_s) as resp:
+            return int(getattr(resp, "status", 200))
+    except urllib.error.HTTPError as e:
+        return int(getattr(e, "code", 0) or 0)
+    except Exception:
+        return -1
+
+
+def _probe_clob_read_endpoints(fetcher: Fetcher) -> list[Endpoint]:
+    """
+    Best-effort discovery for undocumented CLOB read endpoints.
+    We only send GET requests with dummy params and treat non-404 as "exists".
+    """
+    candidates: list[tuple[str, str, dict[str, str]]] = [
+        (
+            "/orderbook-history",
+            "Order book history (time range).",
+            {"asset_id": "0", "startTs": "0", "endTs": "1", "limit": "1", "offset": "0"},
+        ),
+    ]
+    out: list[Endpoint] = []
+    for path, desc, params in candidates:
+        base_url = urllib.parse.urljoin(CLOB_ORIGIN, path)
+        url = base_url
+        if params:
+            url = url + "?" + urllib.parse.urlencode(params)
+        status = _http_status(fetcher, url)
+        if status in (404, -1):
+            continue
+        host, p = _parse_host_path(base_url)
+        out.append(
+            Endpoint(
+                raw=url,
+                normalized=base_url,
+                host=host,
+                path=p,
+                method="GET",
+                description=desc,
+                source_kind="probe",
+                evidence=Evidence(source_url=url, context=f"probe_status={status}"),
+            )
+        )
     return out
 
 
@@ -784,6 +952,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--include-staging", action="store_true", help="Include staging hosts (e.g. clob-staging)")
     ap.add_argument("--include-host", action="append", default=[], help="Include an extra host (repeatable)")
     ap.add_argument("--exclude-host", action="append", default=[], help="Exclude a host (repeatable)")
+    ap.add_argument("--scan-sdks", action="store_true", help="Scan official SDK packages for endpoints (slower)")
+    ap.add_argument("--probe-clob", action="store_true", help="Probe for undocumented CLOB read endpoints (safe GETs)")
     ap.add_argument("--timeout", type=int, default=20, help="HTTP timeout seconds (default: 20)")
     ap.add_argument("--max-pages", type=int, default=400, help="Max docs pages to crawl (default: 400)")
     args = ap.parse_args(argv)
@@ -819,6 +989,22 @@ def main(argv: list[str]) -> int:
     # 3) Extra seed URLs
     for u in args.seed_url:
         sources.append(u)
+
+    # 4) Optional: scan official SDKs (helps catch undocumented endpoints)
+    sdk_items: list[tuple[str, str]] = []
+    if args.scan_sdks:
+        try:
+            s, items = _collect_sdk_endpoints_npm_clob_client(fetcher)
+            sources.extend(s)
+            sdk_items.extend(items)
+        except Exception as e:
+            print(f"[warn] sdk scan (npm clob-client) failed: {e}", file=sys.stderr)
+        try:
+            s, items = _collect_sdk_endpoints_pypi_py_clob_client(fetcher)
+            sources.extend(s)
+            sdk_items.extend(items)
+        except Exception as e:
+            print(f"[warn] sdk scan (pypi py-clob-client) failed: {e}", file=sys.stderr)
 
     # Fetch + extract
     seen_norm: set[str] = set()
@@ -888,6 +1074,29 @@ def main(argv: list[str]) -> int:
                 docs_meta_by_url=docs_meta_by_url,
             )
         )
+
+    # Crawl SDK package contents
+    for src_url, text in sdk_items:
+        full, rel = _extract_from_text(text)
+        full = _filter_to_polymarketish(full)
+        add_items(
+            _make_endpoint_items(
+                source_url=src_url,
+                source_kind="sdk",
+                text=text,
+                full_urls=full,
+                rel_paths=rel,
+                docs_meta_by_url=docs_meta_by_url,
+                force_origin=CLOB_ORIGIN,
+            )
+        )
+
+    # Optional: probe endpoints
+    if args.probe_clob:
+        try:
+            add_items(_probe_clob_read_endpoints(fetcher))
+        except Exception as e:
+            print(f"[warn] probe failed: {e}", file=sys.stderr)
 
     # Final sort stable
     endpoints = _drop_methodless_if_methodful(endpoints)

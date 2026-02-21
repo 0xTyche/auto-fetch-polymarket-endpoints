@@ -22,6 +22,8 @@ from html.parser import HTMLParser
 
 DOCS_LLMS_TXT = "https://docs.polymarket.com/llms.txt"
 POLYMARKET_HOME = "https://polymarket.com"
+CLOB_ORIGIN = "https://clob.polymarket.com"
+GAMMA_ORIGIN = "https://gamma-api.polymarket.com"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,7 +78,7 @@ def _normalize_urlish(raw: str) -> str:
     s = s.strip("\"'`")
 
     # Trim trailing punctuation that often sticks to URLs in markdown/text
-    s = s.rstrip(").,;]}>")
+    s = s.rstrip(").,;:]}>")
 
     # Unescape common JS escapes
     s = s.replace("\\u002F", "/").replace("\\/", "/")
@@ -87,7 +89,7 @@ def _normalize_urlish(raw: str) -> str:
     for delim in (",", "{", "}", "$", " ", "\n", "\t"):
         if delim in s:
             s = s.split(delim, 1)[0]
-    s = s.rstrip(").,;]}>")
+    s = s.rstrip(").,;:]}>")
     return s
 
 
@@ -113,6 +115,12 @@ def _source_origin(source_url: str) -> str:
         return f"{u.scheme}://{u.netloc}"
     return ""
 
+def _source_host(source_url: str) -> str:
+    try:
+        return (urllib.parse.urlparse(source_url).netloc or "").lower()
+    except ValueError:
+        return ""
+
 
 def _defrag(s: str) -> str:
     try:
@@ -134,6 +142,48 @@ def _is_probably_domainish_first_segment(path: str) -> bool:
     return "." in seg
 
 
+def _pick_base_for_relative_path(rel_path: str, source_url: str, text: str) -> str:
+    """
+    Decide which origin to attach a relative path to.
+
+    - For JS bundles and site pages: join to the page origin.
+    - For docs pages: prefer joining to clob/gamma if that host is referenced on the page.
+      (Docs often show endpoints as "GET /book" rather than full URLs.)
+    """
+    host = _source_host(source_url)
+    origin = _source_origin(source_url)
+
+    if host != "docs.polymarket.com":
+        return origin
+
+    t = (text or "").lower()
+    clob_hint = ("clob.polymarket.com" in t) or (CLOB_ORIGIN in t)
+    gamma_hint = ("gamma-api.polymarket.com" in t) or (GAMMA_ORIGIN in t)
+
+    clobish = bool(
+        re.match(
+            r"^/(book|order|orders|trades?|fills?|balances?|positions?|tickers?|prices?|quote|quotes|cancel|cancellations|auth|apikey|api-key|keys?)\b",
+            rel_path,
+            flags=re.I,
+        )
+    )
+    gammaish = bool(re.match(r"^/(events?|markets?|comments?|tags?|series|search|price|prices)\b", rel_path, flags=re.I))
+
+    if clob_hint and gamma_hint:
+        if clobish and not gammaish:
+            return CLOB_ORIGIN
+        if gammaish and not clobish:
+            return GAMMA_ORIGIN
+        # ambiguous: keep relative (don't guess)
+        return ""
+
+    if clob_hint:
+        return CLOB_ORIGIN
+    if gamma_hint:
+        return GAMMA_ORIGIN
+    return ""
+
+
 def _looks_like_endpoint(s: str) -> bool:
     if not s:
         return False
@@ -148,13 +198,29 @@ def _looks_like_endpoint(s: str) -> bool:
 
 def _extract_full_urls(text: str) -> list[str]:
     # Very permissive then we filter.
-    candidates = re.findall(r"https?://[^\s\"'<>\\),{}]+", text)
+    candidates = re.findall(r"https?://[^\s\"'<>\\),{}:]+", text)
     return candidates
+
+
+def _extract_schemeless_polymarket_urls(text: str) -> list[str]:
+    # e.g. "gamma-api.polymarket.com/events" (without https://)
+    candidates = re.findall(r"(?<!://)\b((?:[A-Za-z0-9-]+\.)*polymarket\.com/[^\s\"'<>\\),{}]+)", text)
+    out: list[str] = []
+    for c in candidates:
+        c = c.strip()
+        if not c:
+            continue
+        out.append("https://" + c)
+    return out
 
 
 def _extract_relative_paths(text: str) -> list[str]:
     # Capture "/something" tokens, but not things like "/_next/static/..."
-    candidates = re.findall(r"(?<![A-Za-z0-9_])/(?:api|v\d+|markets?|events?|orders?|trades?|positions?|books?|orderbook|auth|user|users|portfolio)[^\s\"'<>\\),{}]*", text)
+    candidates = re.findall(
+        r"(?<![A-Za-z0-9_])/(?:api|v\d+|markets?|events?|orders?|order|trades?|positions?|books?|book|orderbook|auth|user|users|portfolio|comments?)"
+        r"[^\s\"'<>\\),{}:]*",
+        text,
+    )
     # Drop obvious static assets
     out: list[str] = []
     for c in candidates:
@@ -181,6 +247,10 @@ def _infer_method_near(text: str, needle: str) -> str:
     m2 = re.search(r"\b(get|post|put|patch|delete)\s*\(\s*['\"]" + re.escape(needle) + r"['\"]", window, flags=re.I)
     if m2:
         return m2.group(1).upper()
+    # docs / curl-style: "POST /order" or "GET /book"
+    m3 = re.search(r"\b(GET|POST|PUT|PATCH|DELETE)\b\s+`?" + re.escape(needle) + r"`?\b", window, flags=re.I)
+    if m3:
+        return m3.group(1).upper()
     return ""
 
 
@@ -252,24 +322,21 @@ def _extract_from_html(html: str) -> tuple[list[str], list[str]]:
     text = html_unescape(p.get_text())
 
     # Extract from both visible text and raw HTML attributes.
-    full = _extract_full_urls(text) + _extract_full_urls(html)
+    full = _extract_full_urls(text) + _extract_full_urls(html) + _extract_schemeless_polymarket_urls(text) + _extract_schemeless_polymarket_urls(html)
     rel = _extract_relative_paths(text) + _extract_relative_paths(html)
     return (full, rel)
 
 
 def _extract_from_text(text: str) -> tuple[list[str], list[str]]:
-    return (_extract_full_urls(text), _extract_relative_paths(text))
+    return (_extract_full_urls(text) + _extract_schemeless_polymarket_urls(text), _extract_relative_paths(text))
 
 
 def _collect_docs_pages(fetcher: Fetcher) -> list[str]:
     llms = fetcher.get(DOCS_LLMS_TXT)
-    urls: list[str] = []
-    for line in llms.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if line.startswith("http://") or line.startswith("https://"):
-            urls.append(line)
+    # llms.txt is markdown; extract URLs from link targets.
+    urls = _extract_full_urls(llms) + _extract_schemeless_polymarket_urls(llms)
+    urls = [u for u in urls if u.startswith("https://docs.polymarket.com/") or u.startswith("http://docs.polymarket.com/")]
+    urls = [_defrag(_normalize_urlish(u)) for u in urls]
     # de-dupe while preserving order
     seen = set()
     out: list[str] = []
@@ -313,6 +380,10 @@ def _filter_to_polymarketish(urls: Iterable[str]) -> list[str]:
         except ValueError:
             # Some scraped strings look like URLs but aren't valid.
             continue
+        if not host or not re.match(r"^[a-z0-9.-]+$", host):
+            continue
+        if host.startswith("-") or host.endswith("-"):
+            continue
         if host == "polymarket.com" or host.endswith(".polymarket.com"):
             out.append(s)
             continue
@@ -336,9 +407,11 @@ def _make_endpoint_items(
             return
         if "${" in norm:
             return
-        # If it's a relative endpoint, attach it to the origin of the page/bundle we found it in.
-        if norm.startswith("/") and origin:
-            norm = urllib.parse.urljoin(origin, norm)
+        # If it's a relative endpoint, attach it to a best-guess origin.
+        if norm.startswith("/"):
+            base = _pick_base_for_relative_path(norm, source_url, text) or origin
+            if base:
+                norm = urllib.parse.urljoin(base, norm)
         host, path = _parse_host_path(norm)
         method = _infer_method_near(text, raw) or _infer_method_near(text, norm)
         # Skip broken template fragments.
@@ -397,7 +470,7 @@ def _render_md(endpoints: list[Endpoint], meta: dict) -> str:
     lines: list[str] = []
     lines.append("# Polymarket Endpoints Catalog")
     lines.append("")
-    lines.append("自动生成文件，用于给人类/AI 编程助手快速理解接口。")
+    lines.append("Generated file. Grouped endpoint list with evidence sources.")
     lines.append("")
     lines.append("## Metadata")
     lines.append("")
